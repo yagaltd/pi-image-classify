@@ -5,6 +5,8 @@
  * the API call will fail with an error telling the user to select a vision model.
  * 
  * Output: JSONL append-only catalog for efficient incremental updates.
+ * 
+ * Refactored to use pi-coding-agent's unified complete() API
  */
 
 import { readFile, writeFile, appendFile, readdir, mkdir } from "node:fs/promises";
@@ -12,6 +14,7 @@ import { existsSync } from "node:fs";
 import { join, resolve, basename, extname } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { complete, type UserMessage } from "@mariozechner/pi-ai";
 
 const SUPPORTED_FORMATS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"];
 const DEFAULT_ASSET_FOLDER = "./assets/images";
@@ -40,9 +43,13 @@ async function listImages(dirPath: string): Promise<string[]> {
   return images;
 }
 
+/**
+ * Classify an image using the currently selected model via pi's unified API
+ */
 async function classifyWithVision(
   model: any,
   apiKey: string,
+  headers: Record<string, string>,
   imagePath: string,
   signal?: AbortSignal
 ): Promise<{ description: string; tags: string[] }> {
@@ -64,119 +71,28 @@ Format your response EXACTLY as:
 DESCRIPTION: [your 70-140 character description here]
 TAGS: [tag1, tag2, tag3, tag4, tag5, tag6, tag7, tag8]`;
 
-  const text = await callVisionAPI(model, apiKey, imageBase64, mimeType, prompt, signal);
-  return parseVisionResponse(text);
-}
+  const userMessage: UserMessage = {
+    role: "user",
+    content: [
+      { type: "image", data: imageBase64, mimeType },
+      { type: "text", text: prompt }
+    ],
+    timestamp: Date.now(),
+  };
 
-async function callVisionAPI(model: any, apiKey: string, imageBase64: string, mimeType: string, prompt: string, signal?: AbortSignal): Promise<string> {
-  const provider = model.provider;
-  
-  if (provider === "google" || provider === "google-gemini-cli" || provider === "google-vertex" || provider === "google-antigravity") {
-    const baseUrl = model.baseUrl || "https://generativelanguage.googleapis.com";
-    const modelId = model.id.includes("gemini-2") ? model.id : "gemini-2.0-flash";
-    const url = `${baseUrl}/models/${modelId}:generateContent?key=${apiKey}`;
-    
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal,
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType, data: imageBase64 } }] }],
-        generationConfig: { maxOutputTokens: 512, temperature: 0.4 }
-      }),
-    });
-    
-    if (!response.ok) throw new Error(`API error: ${await response.text()}`);
-    const data = await response.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  }
-  
-  if (provider === "anthropic") {
-    const url = `${model.baseUrl || "https://api.anthropic.com"}/v1/messages`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-      signal,
-      body: JSON.stringify({
-        model: model.id,
-        max_tokens: 512,
-        messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: mimeType, data: imageBase64 } }, { type: "text", text: prompt }] }]
-      }),
-    });
-    
-    if (!response.ok) throw new Error(`API error: ${await response.text()}`);
-    const data = await response.json();
-    return data.content?.[0]?.text || "";
-  }
-  
-  if (provider === "openai") {
-    const url = `${model.baseUrl || "https://api.openai.com/v1"}/chat/completions`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      signal,
-      body: JSON.stringify({
-        model: model.id,
-        messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } }, { type: "text", text: prompt }] }],
-        max_tokens: 512,
-      }),
-    });
-    
-    if (!response.ok) throw new Error(`API error: ${await response.text()}`);
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
-  }
-  
-  // If model has a custom baseUrl (e.g., custom provider), try to use it
-  if (model.baseUrl) {
-    const baseUrl = model.baseUrl;
-    
-    // Try OpenAI-compatible format first
-    try {
-      const url = `${baseUrl}/chat/completions`;
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-        signal,
-        body: JSON.stringify({
-          model: model.id,
-          messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } }, { type: "text", text: prompt }] }],
-          max_tokens: 512,
-        }),
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        return data.choices?.[0]?.message?.content || "";
-      }
-    } catch { /* try next */ }
-    
-    // Try Gemini-compatible format
-    try {
-      const url = `${baseUrl}/models/${model.id}:generateContent?key=${apiKey}`;
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal,
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType, data: imageBase64 } }] }],
-          generationConfig: { maxOutputTokens: 512, temperature: 0.4 }
-        }),
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      }
-    } catch { /* fall through to error */ }
-  }
-  
-  // No supported provider found
-  throw new Error(
-    `Vision not supported for provider "${provider}". ` +
-    `Supported: google (Gemini), anthropic (Claude), openai (GPT-4o). ` +
-    `Current model: ${model.id}. Ensure the model supports vision/image input.`
+  const response = await complete(
+    model,
+    { messages: [userMessage] },
+    { apiKey, headers, signal, maxTokens: 512, temperature: 0.4 }
   );
+
+  // Extract text from response
+  const text = response.content
+    .filter((c): c is { type: "text"; text: string } => c.type === "text")
+    .map((c) => c.text)
+    .join("\n");
+
+  return parseVisionResponse(text);
 }
 
 function parseVisionResponse(text: string): { description: string; tags: string[] } {
@@ -276,7 +192,7 @@ async function loadCatalog(catalogPath: string): Promise<CatalogEntry[]> {
   
   for (const line of lines) {
     try {
-      const entry = JSON.parse(line);
+      const entry = JSON.parse(line) as CatalogEntry;
       entries.push(entry);
     } catch { /* skip malformed lines */ }
   }
@@ -344,10 +260,6 @@ function searchEntries(entries: CatalogEntry[], query: string, limit: number = 1
 }
 
 export default function (pi: ExtensionAPI) {
-  
-  
-  
-  
   pi.registerTool({
     name: "classify_image",
     label: "Classify Image",
@@ -378,8 +290,11 @@ export default function (pi: ExtensionAPI) {
       }
       
       if (!ctx.model) throw new Error("No model selected. Use /model to select a vision-capable model.");
-      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(ctx.model.provider);
-      if (!apiKey) throw new Error(`No API key for ${ctx.model.provider}. Configure it in settings.`);
+      
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+      if (!auth.ok || !auth.apiKey) {
+        throw new Error(auth.ok ? `No API key for ${ctx.model.provider}` : auth.error);
+      }
       
       onUpdate?.({ content: [{ type: "text", text: `Analyzing with ${ctx.model.provider}/${ctx.model.id}...` }] });
       
@@ -387,7 +302,7 @@ export default function (pi: ExtensionAPI) {
       let tags: string[] = [];
       
       if (!description && !params.tags) {
-        const result = await classifyWithVision(ctx.model, apiKey, filepath, signal);
+        const result = await classifyWithVision(ctx.model, auth.apiKey, auth.headers || {}, filepath, signal);
         description = result.description;
         tags = result.tags;
       } else {
@@ -421,9 +336,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  
-  
-  
   pi.registerTool({
     name: "classify_folder",
     label: "Classify Folder",
@@ -451,8 +363,11 @@ export default function (pi: ExtensionAPI) {
       }
       
       if (!ctx.model) throw new Error("No model selected. Use /model to select a vision-capable model.");
-      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(ctx.model.provider);
-      if (!apiKey) throw new Error(`No API key for ${ctx.model.provider}. Configure it in settings.`);
+      
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+      if (!auth.ok || !auth.apiKey) {
+        throw new Error(auth.ok ? `No API key for ${ctx.model.provider}` : auth.error);
+      }
       
       // Filter out already-cataloged images (O(1) per file via grep)
       const imagesToProcess: string[] = [];
@@ -484,7 +399,7 @@ export default function (pi: ExtensionAPI) {
         try {
           onUpdate?.({ content: [{ type: "text", text: `Classifying ${basename(imagePath)} (${classified + 1}/${newImages.length})...` }] });
           
-          const result = await classifyWithVision(ctx.model, apiKey, imagePath, signal);
+          const result = await classifyWithVision(ctx.model, auth.apiKey, auth.headers || {}, imagePath, signal);
           
           const entry: CatalogEntry = {
             filename: basename(imagePath),
@@ -518,9 +433,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  
-  
-  
   pi.registerTool({
     name: "search_images",
     label: "Search Images",
@@ -554,9 +466,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  
-  
-  
   pi.registerTool({
     name: "suggest_images",
     label: "Suggest Images",
@@ -590,9 +499,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  
-  
-  
   pi.registerTool({
     name: "sync_nanobanana",
     label: "Sync Nanobanana",
@@ -638,9 +544,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  
-  
-  
   pi.registerTool({
     name: "get_catalog_stats",
     label: "Catalog Stats",
