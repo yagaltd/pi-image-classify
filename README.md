@@ -16,6 +16,26 @@ Image classification and cataloging for [pi-coding-agent](https://github.com/bad
 pi install https://github.com/yagaltd/pi-image-classify
 ```
 
+## Vision Model Support
+
+Uses your configured vision model automatically:
+
+| Provider | Models |
+|----------|--------|
+| Google | Gemini 2.0+, Gemini 1.5 Pro |
+| Anthropic | Claude 3.5 Sonnet+, Claude 3 Opus |
+| OpenAI | GPT-4o, GPT-4 Vision |
+
+Check available models:
+```
+Use list_vision_models tool
+```
+
+Use specific model:
+```
+Use classify_folder with provider="anthropic", modelId="claude-3-5-sonnet-20241022"
+```
+
 ## Use It
 
 ### 1. Set up asset folder
@@ -71,6 +91,7 @@ Use suggest_images with context="blog post about hiking"
 | `suggest_images` | Get relevant suggestions |
 | `sync_nanobanana` | Copy from nanobanana-output |
 | `get_catalog_stats` | View catalog stats |
+| `list_vision_models` | See available vision models |
 
 ## Output Locations
 
@@ -82,8 +103,8 @@ Use suggest_images with context="blog post about hiking"
 ## CSV Format
 
 ```csv
-filename,description,tags,source,date_added,filepath
-sunset.png,A vibrant sunset over snow-capped mountains...,"sunset,mountains,nature",nanobanana,2024-01-15,./assets/images/sunset.png
+filename,description,tags,source,date_added,filepath,model,provider
+sunset.png,A vibrant sunset over snow-capped mountains...,"sunset,mountains,nature",nanobanana,2024-01-15,./assets/images/sunset.png,gemini-2.0-flash,google
 ```
 
 ## Workflow: Nanobanana → Classify → Use
@@ -107,7 +128,7 @@ Copy and classify in one step:
 
 ## Requirements
 
-- Google API key configured (for Gemini vision)
+- Vision-capable model configured (Google Gemini, Claude, GPT-4o, etc.)
 - Write access to `./assets/` directory
 
 ## License

@@ -6,18 +6,17 @@
  * - Search catalog by text query or tags
  * - Suggest relevant images for content generation
  * - Sync images from nanobanana-output to asset folder
+ * 
+ * Uses the currently active model for vision (if supported) or falls back to Google Gemini.
  */
 
 import { readFile, writeFile, readdir, stat, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve, basename, extname } from "node:path";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { Model } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
-
-const execAsync = promisify(exec);
 
 const SUPPORTED_FORMATS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"];
 const DEFAULT_ASSET_FOLDER = "./assets/images";
@@ -55,14 +54,12 @@ async function listImages(dirPath: string): Promise<string[]> {
 }
 
 function generateTagsFromDescription(description: string): string[] {
-  // Simple keyword extraction - in production could use NLP
   const keywords = description.toLowerCase()
     .replace(/[^a-z0-9\s]/g, "")
     .split(/\s+/)
     .filter(w => w.length > 3)
     .filter(w => !["this", "with", "from", "that", "have", "been", "were", "they", "their", "image", "photo", "picture"].includes(w));
   
-  // Deduplicate and limit
   return [...new Set(keywords)].slice(0, 10);
 }
 
@@ -100,6 +97,224 @@ function parseCSVLine(line: string): string[] {
 }
 
 // ============================================================================
+// Vision Model Interface
+// ============================================================================
+
+interface VisionResult {
+  description: string;
+  tags: string[];
+}
+
+async function classifyWithModel(
+  model: Model<any>,
+  apiKey: string,
+  imagePath: string,
+  signal?: AbortSignal
+): Promise<VisionResult> {
+  // Read image as base64
+  const imageBuffer = await readFile(imagePath);
+  const imageBase64 = imageBuffer.toString("base64");
+  const mimeType = imagePath.endsWith(".png") ? "image/png" : "image/jpeg";
+
+  const prompt = `Analyze this image and provide:
+1. A SHORT description (70-140 characters) - capture the essence of what's in the image
+2. Tags (comma-separated) - relevant keywords for searching later (max 10 tags, single words only)
+
+Format your response as:
+DESCRIPTION: [your 70-140 character description]
+TAGS: [tag1, tag2, tag3, ...]
+
+Be concise and specific. Focus on: subjects, setting, style, mood, colors, and key elements.`;
+
+  // Route to appropriate API based on provider
+  switch (model.provider) {
+    case "google":
+    case "google-gemini-cli":
+    case "google-vertex":
+    case "google-antigravity":
+      return classifyWithGoogle(model, apiKey, imageBase64, mimeType, prompt, signal);
+    
+    case "anthropic":
+      return classifyWithAnthropic(model, apiKey, imageBase64, mimeType, prompt, signal);
+    
+    case "openai":
+      return classifyWithOpenAI(model, apiKey, imageBase64, mimeType, prompt, signal);
+    
+    default:
+      // Try Google as fallback
+      return classifyWithGoogleFallback(apiKey, model.id, imageBase64, mimeType, prompt, signal);
+  }
+}
+
+async function classifyWithGoogle(
+  model: Model<any>,
+  apiKey: string,
+  imageBase64: string,
+  mimeType: string,
+  prompt: string,
+  signal?: AbortSignal
+): Promise<VisionResult> {
+  const baseUrl = model.baseUrl || "https://generativelanguage.googleapis.com/v1beta";
+  const url = `${baseUrl}/models/${model.id}:generateContent?key=${apiKey}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal,
+    body: JSON.stringify({
+      contents: [{
+        parts: [
+          { text: prompt },
+          { inlineData: { mimeType, data: imageBase64 } }
+        ]
+      }],
+      generationConfig: {
+        maxOutputTokens: 256,
+        temperature: 0.3,
+      }
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Google API error: ${error}`);
+  }
+
+  const data = await response.json();
+  return parseVisionResponse(data);
+}
+
+async function classifyWithGoogleFallback(
+  apiKey: string,
+  modelId: string,
+  imageBase64: string,
+  mimeType: string,
+  prompt: string,
+  signal?: AbortSignal
+): Promise<VisionResult> {
+  // Try Gemini 2.0 Flash as fallback
+  const model = modelId.includes("gemini-2") ? modelId : "gemini-2.0-flash";
+  return classifyWithGoogle(
+    { provider: "google", id: model, baseUrl: "https://generativelanguage.googleapis.com/v1beta" } as Model<any>,
+    apiKey,
+    imageBase64,
+    mimeType,
+    prompt,
+    signal
+  );
+}
+
+async function classifyWithAnthropic(
+  model: Model<any>,
+  apiKey: string,
+  imageBase64: string,
+  mimeType: string,
+  prompt: string,
+  signal?: AbortSignal
+): Promise<VisionResult> {
+  const url = `${model.baseUrl || "https://api.anthropic.com"}/v1/messages`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    signal,
+    body: JSON.stringify({
+      model: model.id,
+      max_tokens: 256,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: mimeType as any, data: imageBase64 } },
+          { type: "text", text: prompt }
+        ]
+      }]
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Anthropic API error: ${error}`);
+  }
+
+  const data = await response.json();
+  const text = data.content?.[0]?.text || "";
+  return parseVisionResponseText(text);
+}
+
+async function classifyWithOpenAI(
+  model: Model<any>,
+  apiKey: string,
+  imageBase64: string,
+  mimeType: string,
+  prompt: string,
+  signal?: AbortSignal
+): Promise<VisionResult> {
+  const url = `${model.baseUrl || "https://api.openai.com/v1"}/chat/completions`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    signal,
+    body: JSON.stringify({
+      model: model.id,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+          { type: "text", text: prompt }
+        ]
+      }],
+      max_tokens: 256,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`OpenAI API error: ${error}`);
+  }
+
+  const data = await response.json();
+  const text = data.choices?.[0]?.message?.content || "";
+  return parseVisionResponseText(text);
+}
+
+function parseVisionResponse(data: any): VisionResult {
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  return parseVisionResponseText(text);
+}
+
+function parseVisionResponseText(text: string): VisionResult {
+  const descMatch = text.match(/DESCRIPTION:\s*(.+?)(?:\n|$)/i);
+  const tagsMatch = text.match(/TAGS:\s*(.+?)(?:\n|$)/i);
+  
+  let description = descMatch?.[1]?.trim() || "Image description unavailable";
+  let tagsStr = tagsMatch?.[1]?.trim() || "";
+  
+  // Ensure description is within bounds
+  if (description.length > 140) {
+    description = description.substring(0, 137) + "...";
+  }
+  if (description.length < 70) {
+    description = description.padEnd(70);
+  }
+  
+  let tags = tagsStr.split(",").map((t: string) => t.trim().toLowerCase()).filter((t: string) => t);
+  if (tags.length === 0) {
+    tags = generateTagsFromDescription(description);
+  }
+  tags = [...new Set(tags)].slice(0, 10);
+  
+  return { description, tags };
+}
+
+// ============================================================================
 // Catalog Management
 // ============================================================================
 
@@ -110,6 +325,8 @@ interface CatalogEntry {
   source: string;
   dateAdded: string;
   filepath: string;
+  model?: string;
+  provider?: string;
 }
 
 async function loadCatalog(catalogPath: string): Promise<CatalogEntry[]> {
@@ -132,6 +349,8 @@ async function loadCatalog(catalogPath: string): Promise<CatalogEntry[]> {
         source: parts[3],
         dateAdded: parts[4],
         filepath: parts[5] || parts[0],
+        model: parts[6],
+        provider: parts[7],
       });
     }
   }
@@ -140,7 +359,7 @@ async function loadCatalog(catalogPath: string): Promise<CatalogEntry[]> {
 }
 
 async function saveCatalog(catalogPath: string, entries: CatalogEntry[]): Promise<void> {
-  const header = "filename,description,tags,source,date_added,filepath";
+  const header = "filename,description,tags,source,date_added,filepath,model,provider";
   const lines = entries.map(e => [
     escapeCSV(e.filename),
     escapeCSV(e.description),
@@ -148,6 +367,8 @@ async function saveCatalog(catalogPath: string, entries: CatalogEntry[]): Promis
     escapeCSV(e.source),
     e.dateAdded,
     escapeCSV(e.filepath),
+    e.model || "",
+    e.provider || "",
   ].join(","));
   
   await writeFile(catalogPath, [header, ...lines].join("\n") + "\n", "utf-8");
@@ -155,88 +376,6 @@ async function saveCatalog(catalogPath: string, entries: CatalogEntry[]): Promis
 
 function entryExists(entries: CatalogEntry[], filepath: string): boolean {
   return entries.some(e => e.filepath === filepath || e.filename === basename(filepath));
-}
-
-function entryExistsByFilename(entries: CatalogEntry[], filename: string): boolean {
-  return entries.some(e => e.filename === filename);
-}
-
-// ============================================================================
-// Image Classification (using Gemini API)
-// ============================================================================
-
-async function classifyImageWithVision(
-  apiKey: string,
-  imagePath: string,
-  signal?: AbortSignal
-): Promise<{ description: string; tags: string[] }> {
-  // Read image as base64
-  const imageBuffer = await readFile(imagePath);
-  const imageBase64 = imageBuffer.toString("base64");
-  const mimeType = imagePath.endsWith(".png") ? "image/png" : "image/jpeg";
-  
-  const model = "gemini-2.0-flash"; // Vision model
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  
-  const prompt = `Analyze this image and provide:
-1. A SHORT description (70-140 characters) - capture the essence of what's in the image
-2. Tags (comma-separated) - relevant keywords for searching later (max 10 tags, single words only)
-
-Format your response as:
-DESCRIPTION: [your 70-140 character description]
-TAGS: [tag1, tag2, tag3, ...]
-
-Be concise and specific. Focus on: subjects, setting, style, mood, colors, and key elements.`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    signal,
-    body: JSON.stringify({
-      contents: [{
-        parts: [
-          { text: prompt },
-          { inlineData: { mimeType, data: imageBase64 } }
-        ]
-      }],
-      generationConfig: {
-        maxOutputTokens: 256,
-        temperature: 0.3,
-      }
-    }),
-  });
-  
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Gemini API error: ${error}`);
-  }
-  
-  const data = await response.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  
-  // Parse response
-  const descMatch = text.match(/DESCRIPTION:\s*(.+?)(?:\n|$)/i);
-  const tagsMatch = text.match(/TAGS:\s*(.+?)(?:\n|$)/i);
-  
-  let description = descMatch?.[1]?.trim() || "Image description unavailable";
-  let tagsStr = tagsMatch?.[1]?.trim() || "";
-  
-  // Ensure description is within bounds
-  if (description.length > 140) {
-    description = description.substring(0, 137) + "...";
-  }
-  if (description.length < 70) {
-    description = description.padEnd(70);
-  }
-  
-  // Parse tags
-  let tags = tagsStr.split(",").map(t => t.trim().toLowerCase()).filter(t => t);
-  if (tags.length === 0) {
-    tags = generateTagsFromDescription(description);
-  }
-  tags = [...new Set(tags)].slice(0, 10);
-  
-  return { description, tags };
 }
 
 // ============================================================================
@@ -253,16 +392,13 @@ function searchEntries(entries: CatalogEntry[], query: string, limit: number = 1
     const tagsLower = entry.tags.toLowerCase();
     const filenameLower = entry.filename.toLowerCase();
     
-    // Exact filename match
     if (filenameLower.includes(queryLower)) score += 10;
     
-    // Tag matches
     for (const word of queryWords) {
       if (tagsLower.includes(word)) score += 5;
       if (descLower.includes(word)) score += 2;
     }
     
-    // Description word match
     const descWords = descLower.split(/\s+/);
     for (const word of queryWords) {
       if (descWords.some(w => w.startsWith(word) || word.startsWith(w))) score += 1;
@@ -279,8 +415,21 @@ function searchEntries(entries: CatalogEntry[], query: string, limit: number = 1
 }
 
 function suggestEntries(entries: CatalogEntry[], context: string, limit: number = 5): CatalogEntry[] {
-  // For suggestions, be more permissive - match on any relevant keyword
   return searchEntries(entries, context, limit);
+}
+
+// ============================================================================
+// Available Vision Models
+// ============================================================================
+
+function getVisionModels(registry: any): Array<{ model: Model<any>; label: string }> {
+  const available = registry.getAvailable ? registry.getAvailable() : registry.getAll ? registry.getAll() : [];
+  return available
+    .filter((m: Model<any>) => m.input && m.input.includes("image"))
+    .map((m: Model<any>) => ({
+      model: m,
+      label: `${m.provider}/${m.id} ${m.name ? `(${m.name})` : ""}`
+    }));
 }
 
 // ============================================================================
@@ -295,19 +444,20 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "classify_image",
     label: "Classify Image",
-    description: "Classify a single image: generate description (70-140 chars) and tags, add to catalog CSV.",
+    description: "Classify a single image: generate description (70-140 chars) and tags, add to catalog CSV. Uses current vision model or specified model.",
     parameters: Type.Object({
       file: Type.String({ description: "Path to the image file to classify" }),
       description: Type.Optional(Type.String({ description: "Manual description override (70-140 chars)" })),
       tags: Type.Optional(Type.String({ description: "Manual comma-separated tags override" })),
       source: Type.Optional(Type.String({ description: "Source label (e.g., 'manual', 'nanobanana', 'downloaded')" })),
+      provider: Type.Optional(StringEnum(["google", "anthropic", "openai", "current"] as const)),
+      modelId: Type.Optional(Type.String({ description: "Specific model ID to use (e.g., 'gemini-2.0-flash', 'claude-3-5-sonnet-20241022')" })),
     }),
 
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const catalogPath = resolve(ctx.cwd, DEFAULT_CATALOG_FILE);
       const assetFolder = resolve(ctx.cwd, DEFAULT_ASSET_FOLDER);
       
-      // Ensure directories exist
       await ensureDirectory(assetFolder);
       await ensureDirectory(resolve(ctx.cwd, "./assets"));
       
@@ -334,24 +484,48 @@ export default function (pi: ExtensionAPI) {
         };
       }
       
-      onUpdate?.({ content: [{ type: "text", text: "Analyzing image with AI..." }] });
+      // Determine which model to use
+      let visionModel: Model<any> | null = null;
+      let apiKey: string | undefined;
+      
+      if (params.modelId) {
+        // Specific model requested
+        const targetProvider = params.provider || ctx.model?.provider || "google";
+        visionModel = ctx.modelRegistry.find(targetProvider, params.modelId);
+        if (!visionModel) {
+          throw new Error(`Model not found: ${targetProvider}/${params.modelId}`);
+        }
+        apiKey = await ctx.modelRegistry.getApiKeyForProvider(targetProvider);
+      } else {
+        // Use current model if it supports vision
+        if (ctx.model && ctx.model.input && ctx.model.input.includes("image")) {
+          visionModel = ctx.model;
+          apiKey = await ctx.modelRegistry.getApiKeyForProvider(visionModel.provider);
+        } else {
+          // Check for available vision models
+          const visionModels = getVisionModels(ctx.modelRegistry);
+          if (visionModels.length > 0) {
+            visionModel = visionModels[0].model;
+            apiKey = await ctx.modelRegistry.getApiKeyForProvider(visionModel.provider);
+          }
+        }
+      }
+      
+      if (!visionModel || !apiKey) {
+        throw new Error("No vision-capable model available. Configure a vision model (Google Gemini, Claude, GPT-4o, etc.) in your settings.");
+      }
+      
+      onUpdate?.({ content: [{ type: "text", text: `Analyzing with ${visionModel.provider}/${visionModel.id}...` }] });
       
       let description = params.description || "";
       let tags: string[] = [];
       
       if (!description && !params.tags) {
-        // Use Gemini vision API
-        const apiKey = await ctx.modelRegistry.getApiKeyForProvider("google");
-        if (!apiKey) {
-          throw new Error("No Google API key found. Configure Gemini API key.");
-        }
-        
-        const result = await classifyImageWithVision(apiKey, filepath, signal);
+        const result = await classifyWithModel(visionModel, apiKey, filepath, signal);
         description = result.description;
         tags = result.tags;
       } else {
         if (description) {
-          // Ensure bounds
           if (description.length > 140) description = description.substring(0, 137) + "...";
           if (description.length < 70) description = description.padEnd(70);
         }
@@ -360,7 +534,6 @@ export default function (pi: ExtensionAPI) {
         }
       }
       
-      // Add entry
       const entry: CatalogEntry = {
         filename: basename(filepath),
         description,
@@ -368,6 +541,8 @@ export default function (pi: ExtensionAPI) {
         source: params.source || "manual",
         dateAdded: new Date().toISOString().split("T")[0],
         filepath,
+        model: visionModel.id,
+        provider: visionModel.provider,
       };
       
       entries.push(entry);
@@ -376,11 +551,13 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `Classified and added to catalog:\n${description}\nTags: ${entry.tags}`
+          text: `Classified with ${visionModel.provider}/${visionModel.id}:\n${description}\nTags: ${entry.tags}`
         }],
         details: { 
           catalogPath,
           entry,
+          model: visionModel.id,
+          provider: visionModel.provider,
           totalEntries: entries.length,
         },
       };
@@ -393,10 +570,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "classify_folder",
     label: "Classify Folder",
-    description: "Batch classify all images in a folder. Skips already-cataloged images.",
+    description: "Batch classify all images in a folder. Skips already-cataloged images. Uses current vision model.",
     parameters: Type.Object({
       folder: Type.Optional(Type.String({ description: "Folder path (default: ./assets/images)" })),
       source: Type.Optional(Type.String({ description: "Source label for all images" })),
+      provider: Type.Optional(StringEnum(["google", "anthropic", "openai", "current"] as const)),
+      modelId: Type.Optional(Type.String({ description: "Specific model ID" })),
       limit: Type.Optional(Type.Number({ description: "Max images to classify (default: unlimited)" })),
     }),
 
@@ -424,10 +603,31 @@ export default function (pi: ExtensionAPI) {
       }
       
       const entries = await loadCatalog(catalogPath);
-      const apiKey = await ctx.modelRegistry.getApiKeyForProvider("google");
       
-      if (!apiKey) {
-        throw new Error("No Google API key found. Configure Gemini API key.");
+      // Determine model to use
+      let visionModel: Model<any> | null = null;
+      let apiKey: string | undefined;
+      
+      if (params.modelId) {
+        const targetProvider = params.provider || ctx.model?.provider || "google";
+        visionModel = ctx.modelRegistry.find(targetProvider, params.modelId);
+        if (!visionModel) {
+          throw new Error(`Model not found: ${targetProvider}/${params.modelId}`);
+        }
+        apiKey = await ctx.modelRegistry.getApiKeyForProvider(targetProvider);
+      } else if (ctx.model && ctx.model.input && ctx.model.input.includes("image")) {
+        visionModel = ctx.model;
+        apiKey = await ctx.modelRegistry.getApiKeyForProvider(visionModel.provider);
+      } else {
+        const visionModels = getVisionModels(ctx.modelRegistry);
+        if (visionModels.length > 0) {
+          visionModel = visionModels[0].model;
+          apiKey = await ctx.modelRegistry.getApiKeyForProvider(visionModel.provider);
+        }
+      }
+      
+      if (!visionModel || !apiKey) {
+        throw new Error("No vision-capable model available. Configure a vision model in your settings.");
       }
       
       const newImages = images
@@ -443,7 +643,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
       
-      onUpdate?.({ content: [{ type: "text", text: `Classifying ${newImages.length} new images...` }] });
+      onUpdate?.({ content: [{ type: "text", text: `Classifying ${newImages.length} images with ${visionModel.provider}/${visionModel.id}...` }] });
       
       const results: CatalogEntry[] = [];
       let classified = 0;
@@ -455,7 +655,7 @@ export default function (pi: ExtensionAPI) {
             details: { progress: Math.round((classified / newImages.length) * 100) },
           });
           
-          const result = await classifyImageWithVision(apiKey, imagePath, signal);
+          const result = await classifyWithModel(visionModel, apiKey, imagePath, signal);
           
           const entry: CatalogEntry = {
             filename: basename(imagePath),
@@ -464,6 +664,8 @@ export default function (pi: ExtensionAPI) {
             source: params.source || "batch",
             dateAdded: new Date().toISOString().split("T")[0],
             filepath: imagePath,
+            model: visionModel.id,
+            provider: visionModel.provider,
           };
           
           entries.push(entry);
@@ -471,7 +673,6 @@ export default function (pi: ExtensionAPI) {
           classified++;
           
         } catch (error) {
-          // Continue with other images
           console.error(`Failed to classify ${imagePath}:`, error);
         }
       }
@@ -481,14 +682,54 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `Classified ${classified} images:\n${results.map(r => `- ${r.filename}: ${r.description}`).join("\n")}${skipped > 0 ? `\n\nSkipped ${skipped} already-cataloged images` : ""}`
+          text: `Classified ${classified} images with ${visionModel.provider}/${visionModel.id}:\n${results.map(r => `- ${r.filename}: ${r.description}`).join("\n")}${skipped > 0 ? `\n\nSkipped ${skipped} already-cataloged images` : ""}`
         }],
         details: { 
           catalogPath,
           classified,
           skipped,
           results,
+          model: visionModel.id,
+          provider: visionModel.provider,
           totalEntries: entries.length,
+        },
+      };
+    },
+  });
+
+  // --------------------------------------------------------------------------
+  // Tool: list_vision_models
+  // --------------------------------------------------------------------------
+  pi.registerTool({
+    name: "list_vision_models",
+    label: "List Vision Models",
+    description: "List all configured models that support image vision.",
+    parameters: Type.Object({}),
+
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const visionModels = getVisionModels(ctx.modelRegistry);
+      const current = ctx.model;
+      const currentSupportsVision = current && current.input && current.input.includes("image");
+      
+      const lines = [
+        `Configured vision models (${visionModels.length}):`,
+        "",
+        ...visionModels.map((vm, i) => {
+          const isCurrent = current && vm.model.id === current.id && vm.model.provider === current.provider;
+          return `${isCurrent ? "★" : " "} ${vm.label}${isCurrent ? " (current)" : ""}`;
+        }),
+        "",
+        currentSupportsVision 
+          ? `Current model: ${current?.provider}/${current?.id} ✓ supports vision`
+          : `Current model: ${current?.provider}/${current?.id} ✗ no vision`,
+      ];
+      
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { 
+          visionModels: visionModels.map(vm => ({ provider: vm.model.provider, id: vm.model.id })),
+          currentModel: current ? { provider: current.provider, id: current.id } : null,
+          currentSupportsVision,
         },
       };
     },
@@ -508,7 +749,6 @@ export default function (pi: ExtensionAPI) {
 
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const catalogPath = resolve(ctx.cwd, DEFAULT_CATALOG_FILE);
-      
       const entries = await loadCatalog(catalogPath);
       
       if (entries.length === 0) {
@@ -531,7 +771,7 @@ export default function (pi: ExtensionAPI) {
         content: [{
           type: "text",
           text: `Found ${results.length} images:\n${results.map(r => 
-            `- ${r.filename}\n  "${r.description}"\n  Tags: ${r.tags}\n  Path: ${r.filepath}`
+            `- ${r.filename}\n  "${r.description}"\n  Tags: ${r.tags}\n  Path: ${r.filepath}${r.model ? `\n  Model: ${r.provider}/${r.model}` : ""}`
           ).join("\n\n")}`
         }],
         details: { 
@@ -558,7 +798,6 @@ export default function (pi: ExtensionAPI) {
 
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const catalogPath = resolve(ctx.cwd, DEFAULT_CATALOG_FILE);
-      
       const entries = await loadCatalog(catalogPath);
       
       if (entries.length === 0) {
@@ -620,7 +859,6 @@ export default function (pi: ExtensionAPI) {
       const nanobananaImages = await listImages(nanobananaPath);
       const assetImages = await listImages(assetFolder);
       
-      // Find images not yet in assets
       const existingFilenames = new Set(assetImages.map(p => basename(p)));
       const newImages = nanobananaImages.filter(p => !existingFilenames.has(basename(p)));
       
@@ -683,12 +921,18 @@ export default function (pi: ExtensionAPI) {
         return acc;
       }, {} as Record<string, number>);
       
+      const models = entries.reduce((acc, e) => {
+        const key = e.model ? `${e.provider}/${e.model}` : "unknown";
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+      
       return {
         content: [{
           type: "text",
-          text: `Image Catalog Stats:\n- Total images: ${entries.length}\n- Asset folder: ${DEFAULT_ASSET_FOLDER}\n- Catalog file: ${catalogPath}\n\nBy source:\n${Object.entries(sources).map(([src, count]) => `- ${src}: ${count}`).join("\n")}`
+          text: `Image Catalog Stats:\n- Total images: ${entries.length}\n- Asset folder: ${DEFAULT_ASSET_FOLDER}\n- Catalog file: ${catalogPath}\n\nBy source:\n${Object.entries(sources).map(([src, count]) => `- ${src}: ${count}`).join("\n")}\n\nBy model:\n${Object.entries(models).map(([model, count]) => `- ${model}: ${count}`).join("\n")}`
         }],
-        details: { totalEntries: entries.length, sources, catalogPath },
+        details: { totalEntries: entries.length, sources, models, catalogPath },
       };
     },
   });
@@ -700,15 +944,35 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("classify", {
     description: "Classify images in ./assets/images/ and add to catalog",
     handler: async (args, ctx) => {
-      const folder = args?.trim() || DEFAULT_ASSET_FOLDER;
-      ctx.ui.notify(`Classifying images in ${folder}...`, "info");
+      const current = ctx.model;
+      const supportsVision = current && current.input && current.input.includes("image");
+      const modelInfo = supportsVision 
+        ? `${current?.provider}/${current?.id}` 
+        : "(no vision model selected)";
+      
+      ctx.ui.notify(`Classifying with ${modelInfo}...`, "info");
     },
   });
 
   pi.registerCommand("images", {
     description: "Image catalog commands: search, sync, stats",
     handler: async (args, ctx) => {
-      ctx.ui.notify("Use: /images search <query>, /images sync, or /classify", "info");
+      const stats = ctx.ui.hasUI ? await ctx.ui.select("Select command:", [
+        "search - Search catalog",
+        "sync - Sync from nanobanana",
+        "stats - View statistics",
+        "models - List vision models",
+      ]) : null;
+      
+      if (stats?.startsWith("search")) {
+        ctx.ui.notify("Use: search_images with query=...", "info");
+      } else if (stats?.startsWith("sync")) {
+        ctx.ui.notify("Use: sync_nanobanana tool", "info");
+      } else if (stats?.startsWith("stats")) {
+        ctx.ui.notify("Use: get_catalog_stats tool", "info");
+      } else if (stats?.startsWith("models")) {
+        ctx.ui.notify("Use: list_vision_models tool", "info");
+      }
     },
   });
 }

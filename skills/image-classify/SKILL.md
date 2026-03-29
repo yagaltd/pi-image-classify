@@ -15,6 +15,23 @@ Enable:
 - **Suggestions**: Get relevant image suggestions for content generation
 - **Sync**: Import images from nanobanana-output
 
+## Vision Model Selection
+
+The extension automatically uses:
+1. **Current active model** - if it supports vision (has image input)
+2. **First available vision model** - from your configured models
+3. **Supported models**: Google Gemini, Anthropic Claude (3.5+), OpenAI GPT-4o
+
+Check available models:
+```
+Use list_vision_models tool
+```
+
+Force a specific model:
+```
+Use classify_folder with folder="assets/images", provider="google", modelId="gemini-2.0-flash"
+```
+
 ## Workflow
 
 ### 1. Set Up Asset Folder
@@ -49,6 +66,11 @@ Use classify_image with file="assets/images/myphoto.jpg"
 Use classify_folder with folder="assets/images"
 ```
 
+**With specific model:**
+```
+Use classify_folder with folder="assets/images", provider="anthropic", modelId="claude-3-5-sonnet-20241022"
+```
+
 ### 4. Search for Images
 
 **By text query:**
@@ -71,6 +93,7 @@ Use suggest_images with context="blog post about hiking in mountains"
 | `suggest_images` | Get relevant images for content generation |
 | `sync_nanobanana` | Copy new images from nanobanana-output |
 | `get_catalog_stats` | View catalog statistics |
+| `list_vision_models` | See which models support vision |
 
 ## Output Location
 
@@ -80,8 +103,8 @@ Use suggest_images with context="blog post about hiking in mountains"
 ## CSV Format
 
 ```csv
-filename,description,tags,source,date_added,filepath
-sunset.png,A vibrant sunset over snow-capped mountains...,"sunset,mountains,nature,landscape",nanobanana,2024-01-15,/path/to/sunset.png
+filename,description,tags,source,date_added,filepath,model,provider
+sunset.png,A vibrant sunset over snow-capped mountains...,"sunset,mountains,nature",nanobanana,2024-01-15,/path/to/sunset.png,gemini-2.0-flash,google
 ```
 
 ## Example Interactions
@@ -104,8 +127,8 @@ User: Write a blog post about mountain hiking
 ```
 User: Generate a logo for my app
 → Nanobanana saves to ./nanobanana-output/
-→ User: /sync-nanobanana
-→ User: /classify
+→ User: Use sync_nanobanana tool
+→ User: Use classify_folder tool
 → Images added to catalog
 ```
 
@@ -118,12 +141,12 @@ User: I added new photos to assets/images
 
 ## Best Practices
 
-1. **Review before cataloging**: Images are added to catalog immediately
-2. **Use descriptive filenames**: Helps with manual searching
+1. **Use vision-capable models**: Claude 3.5+, GPT-4o, Gemini 2.0
+2. **Check available models**: Run `list_vision_models` first
 3. **Classify in batches**: More efficient than single images
 4. **Sync + Classify**: After generating with nanobanana, use both tools
 
 ## Requirements
 
-- Google API key configured (for Gemini vision)
+- A vision-capable model configured (Google Gemini, Claude, GPT-4o, etc.)
 - Write access to `./assets/` directory
