@@ -127,21 +127,56 @@ async function callVisionAPI(model: any, apiKey: string, imageBase64: string, mi
     return data.choices?.[0]?.message?.content || "";
   }
   
-  // Default: Gemini-compatible API
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model.id}:generateContent?key=${apiKey}`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    signal,
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType, data: imageBase64 } }] }],
-      generationConfig: { maxOutputTokens: 512, temperature: 0.4 }
-    }),
-  });
+  // If model has a custom baseUrl (e.g., custom provider), try to use it
+  if (model.baseUrl) {
+    const baseUrl = model.baseUrl;
+    
+    // Try OpenAI-compatible format first
+    try {
+      const url = `${baseUrl}/chat/completions`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+        signal,
+        body: JSON.stringify({
+          model: model.id,
+          messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } }, { type: "text", text: prompt }] }],
+          max_tokens: 512,
+        }),
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        return data.choices?.[0]?.message?.content || "";
+      }
+    } catch { /* try next */ }
+    
+    // Try Gemini-compatible format
+    try {
+      const url = `${baseUrl}/models/${model.id}:generateContent?key=${apiKey}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal,
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType, data: imageBase64 } }] }],
+          generationConfig: { maxOutputTokens: 512, temperature: 0.4 }
+        }),
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      }
+    } catch { /* fall through to error */ }
+  }
   
-  if (!response.ok) throw new Error(`API error: ${await response.text()}`);
-  const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  // No supported provider found
+  throw new Error(
+    `Vision not supported for provider "${provider}". ` +
+    `Supported: google (Gemini), anthropic (Claude), openai (GPT-4o). ` +
+    `Current model: ${model.id}. Ensure the model supports vision/image input.`
+  );
 }
 
 function parseVisionResponse(text: string): { description: string; tags: string[] } {
