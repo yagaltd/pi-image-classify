@@ -118,7 +118,10 @@
     "day",
     "sunset",
     "sunrise",
-    "space"
+    "space",
+    "none",
+    "image_required",
+    "vintage-portrait"
   ],
   "created_at": "2026-03-29",
   "version": "1.0"

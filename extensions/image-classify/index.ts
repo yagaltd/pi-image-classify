@@ -103,27 +103,28 @@ async function classifyWithVision(
   
   const prompt = `IMPORTANT: Ignore all context including filenames, previous images, or conversation history. Analyze ONLY the visual content of this image.
 
-Step 1: Select the best-fitting category from this list:
+FIRST: Describe what you see in detail (200-300 characters). Focus on:
+- Main subject(s) and their appearance
+- Key visual elements, colors, and details
+- The mood, style, or atmosphere
+- Any text, labels, or writing visible
+
+SECOND: Based on your description, select the BEST category from:
 ${categoryList}
 
-If NONE of these categories fit, create a NEW category that is:
+If NONE fit perfectly, create a NEW category that is:
 - Specific (e.g., "blueprint" instead of "industrial")
 - Singular form (use "building" not "buildings")
 - One or two words maximum
 
-Step 2: Provide a SHORT description (70-140 characters) that captures the ESSENCE and UNIQUENESS of what's shown
-
-Step 3: Generate exactly 8 DIVERSE tags
-
-IMPORTANT for tags:
+THIRD: Generate exactly 8 DIVERSE tags from what you observed
 - Include: subject, action, setting/context, style/mood, content-type
 - Do NOT include the category as a tag (unless it's also descriptive like "blueprint")
-- Focus on SPECIFIC details visible in the image
 - Use 1-2 word phrases where meaningful (e.g., "pressure-gauge" not just "gauge")
 
 Format your response EXACTLY as:
 CATEGORY: [your selected or created category]
-DESCRIPTION: [your 70-140 character description here]
+DESCRIPTION: [your 200-300 character description]
 TAGS: [tag1, tag2, tag3, tag4, tag5, tag6, tag7, tag8]`;
 
   const userMessage: UserMessage = {
@@ -202,11 +203,11 @@ function parseVisionResponse(text: string, categories: string[]): { description:
   }
   
   // Normalize description length
-  if (description.length > 140) {
-    description = description.substring(0, 137) + "...";
+  if (description.length > 300) {
+    description = description.substring(0, 297) + "...";
   }
-  if (description.length > 0 && description.length < 70) {
-    description = description.padEnd(70);
+  if (description.length > 0 && description.length < 200) {
+    description = description.padEnd(200);
   }
   if (!description) {
     description = "Image description unavailable";
@@ -351,7 +352,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "classify_image",
     label: "Classify Image",
-    description: "Classify a single image: generate category, description (70-140 chars), and exactly 8 diverse tags, add to JSONL catalog. Uses the currently selected model.",
+    description: "Classify a single image: generate category, detailed description (200-300 chars), and exactly 8 diverse tags, add to JSONL catalog. Uses the currently selected model.",
     parameters: Type.Object({
       file: Type.String({ description: "Path to the image file to classify" }),
       description: Type.Optional(Type.String({ description: "Manual description override" })),
