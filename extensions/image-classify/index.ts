@@ -432,6 +432,77 @@ function getVisionModels(registry: any): Array<{ model: Model<any>; label: strin
     }));
 }
 
+interface VisionModelResult {
+  model: Model<any>;
+  apiKey: string;
+  usedFallback: boolean;
+}
+
+/**
+ * Get the best vision model to use.
+ * Priority:
+ * 1. Explicitly specified model
+ * 2. Current model (trust it supports vision)
+ * 3. Any available vision model
+ * 4. Google Gemini as fallback
+ */
+async function getVisionModel(
+  ctx: any,
+  explicitProvider?: string,
+  explicitModelId?: string
+): Promise<VisionModelResult> {
+  // 1. Explicit model requested
+  if (explicitModelId) {
+    const provider = explicitProvider || ctx.model?.provider || "google";
+    const model = ctx.modelRegistry.find(provider, explicitModelId);
+    if (!model) {
+      throw new Error(`Model not found: ${provider}/${explicitModelId}. Check your settings.`);
+    }
+    const apiKey = await ctx.modelRegistry.getApiKeyForProvider(provider);
+    if (!apiKey) {
+      throw new Error(`No API key configured for ${provider}. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY in your auth.json.`);
+    }
+    return { model, apiKey, usedFallback: false };
+  }
+
+  // 2. Try current model first (trust it supports vision)
+  if (ctx.model) {
+    const apiKey = await ctx.modelRegistry.getApiKeyForProvider(ctx.model.provider);
+    if (apiKey) {
+      return { model: ctx.model, apiKey, usedFallback: false };
+    }
+  }
+
+  // 3. Try any available vision model
+  const visionModels = getVisionModels(ctx.modelRegistry);
+  if (visionModels.length > 0) {
+    const vm = visionModels[0];
+    const apiKey = await ctx.modelRegistry.getApiKeyForProvider(vm.model.provider);
+    if (apiKey) {
+      return { model: vm.model, apiKey, usedFallback: false };
+    }
+  }
+
+  // 4. Fallback to Google Gemini
+  const googleModel = ctx.modelRegistry.find("google", "gemini-2.0-flash")
+    || ctx.modelRegistry.find("google", "gemini-1.5-flash")
+    || ctx.modelRegistry.find("google", "gemini-2.0-flash-preview");
+  
+  if (googleModel) {
+    const apiKey = await ctx.modelRegistry.getApiKeyForProvider("google");
+    if (apiKey) {
+      return { model: googleModel, apiKey, usedFallback: true };
+    }
+  }
+
+  throw new Error(
+    "No vision model available. Options:\n" +
+    "1. Select a vision-capable model with /model\n" +
+    "2. Configure a vision model (Gemini, Claude, GPT-4o) in settings\n" +
+    "3. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY"
+  );
+}
+
 // ============================================================================
 // Extension
 // ============================================================================
@@ -485,43 +556,23 @@ export default function (pi: ExtensionAPI) {
       }
       
       // Determine which model to use
-      let visionModel: Model<any> | null = null;
-      let apiKey: string | undefined;
+      // Get vision model (tries current model first, then falls back to Gemini)
+      const visionResult = await getVisionModel(ctx, params.provider, params.modelId);
       
-      if (params.modelId) {
-        // Specific model requested
-        const targetProvider = params.provider || ctx.model?.provider || "google";
-        visionModel = ctx.modelRegistry.find(targetProvider, params.modelId);
-        if (!visionModel) {
-          throw new Error(`Model not found: ${targetProvider}/${params.modelId}`);
-        }
-        apiKey = await ctx.modelRegistry.getApiKeyForProvider(targetProvider);
-      } else {
-        // Use current model if it supports vision
-        if (ctx.model && ctx.model.input && ctx.model.input.includes("image")) {
-          visionModel = ctx.model;
-          apiKey = await ctx.modelRegistry.getApiKeyForProvider(visionModel.provider);
-        } else {
-          // Check for available vision models
-          const visionModels = getVisionModels(ctx.modelRegistry);
-          if (visionModels.length > 0) {
-            visionModel = visionModels[0].model;
-            apiKey = await ctx.modelRegistry.getApiKeyForProvider(visionModel.provider);
-          }
-        }
-      }
-      
-      if (!visionModel || !apiKey) {
-        throw new Error("No vision-capable model available. Configure a vision model (Google Gemini, Claude, GPT-4o, etc.) in your settings.");
-      }
-      
-      onUpdate?.({ content: [{ type: "text", text: `Analyzing with ${visionModel.provider}/${visionModel.id}...` }] });
+      onUpdate?.({ 
+        content: [{ 
+          type: "text", 
+          text: visionResult.usedFallback 
+            ? `Current model may not support vision. Trying ${visionResult.model.provider}/${visionResult.model.id}...`
+            : `Analyzing with ${visionResult.model.provider}/${visionResult.model.id}...`
+        }] 
+      });
       
       let description = params.description || "";
       let tags: string[] = [];
       
       if (!description && !params.tags) {
-        const result = await classifyWithModel(visionModel, apiKey, filepath, signal);
+        const result = await classifyWithModel(visionResult.model, visionResult.apiKey, filepath, signal);
         description = result.description;
         tags = result.tags;
       } else {
@@ -541,8 +592,8 @@ export default function (pi: ExtensionAPI) {
         source: params.source || "manual",
         dateAdded: new Date().toISOString().split("T")[0],
         filepath,
-        model: visionModel.id,
-        provider: visionModel.provider,
+        model: visionResult.model.id,
+        provider: visionResult.model.provider,
       };
       
       entries.push(entry);
@@ -551,13 +602,13 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `Classified with ${visionModel.provider}/${visionModel.id}:\n${description}\nTags: ${entry.tags}`
+          text: `Classified with ${visionResult.model.provider}/${visionResult.model.id}:\n${description}\nTags: ${entry.tags}`
         }],
         details: { 
           catalogPath,
           entry,
-          model: visionModel.id,
-          provider: visionModel.provider,
+          model: visionResult.model.id,
+          provider: visionResult.model.provider,
           totalEntries: entries.length,
         },
       };
@@ -604,31 +655,8 @@ export default function (pi: ExtensionAPI) {
       
       const entries = await loadCatalog(catalogPath);
       
-      // Determine model to use
-      let visionModel: Model<any> | null = null;
-      let apiKey: string | undefined;
-      
-      if (params.modelId) {
-        const targetProvider = params.provider || ctx.model?.provider || "google";
-        visionModel = ctx.modelRegistry.find(targetProvider, params.modelId);
-        if (!visionModel) {
-          throw new Error(`Model not found: ${targetProvider}/${params.modelId}`);
-        }
-        apiKey = await ctx.modelRegistry.getApiKeyForProvider(targetProvider);
-      } else if (ctx.model && ctx.model.input && ctx.model.input.includes("image")) {
-        visionModel = ctx.model;
-        apiKey = await ctx.modelRegistry.getApiKeyForProvider(visionModel.provider);
-      } else {
-        const visionModels = getVisionModels(ctx.modelRegistry);
-        if (visionModels.length > 0) {
-          visionModel = visionModels[0].model;
-          apiKey = await ctx.modelRegistry.getApiKeyForProvider(visionModel.provider);
-        }
-      }
-      
-      if (!visionModel || !apiKey) {
-        throw new Error("No vision-capable model available. Configure a vision model in your settings.");
-      }
+      // Get vision model (tries current model first, then falls back to Gemini)
+      const visionResult = await getVisionModel(ctx, params.provider, params.modelId);
       
       const newImages = images
         .filter(img => !entryExists(entries, img))
@@ -643,7 +671,12 @@ export default function (pi: ExtensionAPI) {
         };
       }
       
-      onUpdate?.({ content: [{ type: "text", text: `Classifying ${newImages.length} images with ${visionModel.provider}/${visionModel.id}...` }] });
+      onUpdate?.({ content: [{ 
+        type: "text", 
+        text: visionResult.usedFallback 
+          ? `Classifying ${newImages.length} images with ${visionResult.model.provider}/${visionResult.model.id}...` 
+          : `Classifying ${newImages.length} images with ${visionResult.model.provider}/${visionResult.model.id}...`
+      }] });
       
       const results: CatalogEntry[] = [];
       let classified = 0;
@@ -655,7 +688,7 @@ export default function (pi: ExtensionAPI) {
             details: { progress: Math.round((classified / newImages.length) * 100) },
           });
           
-          const result = await classifyWithModel(visionModel, apiKey, imagePath, signal);
+          const result = await classifyWithModel(visionResult.model, visionResult.apiKey, imagePath, signal);
           
           const entry: CatalogEntry = {
             filename: basename(imagePath),
@@ -664,8 +697,8 @@ export default function (pi: ExtensionAPI) {
             source: params.source || "batch",
             dateAdded: new Date().toISOString().split("T")[0],
             filepath: imagePath,
-            model: visionModel.id,
-            provider: visionModel.provider,
+            model: visionResult.model.id,
+            provider: visionResult.model.provider,
           };
           
           entries.push(entry);
@@ -682,15 +715,15 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `Classified ${classified} images with ${visionModel.provider}/${visionModel.id}:\n${results.map(r => `- ${r.filename}: ${r.description}`).join("\n")}${skipped > 0 ? `\n\nSkipped ${skipped} already-cataloged images` : ""}`
+          text: `Classified ${classified} images with ${visionResult.model.provider}/${visionResult.model.id}:\n${results.map(r => `- ${r.filename}: ${r.description}`).join("\n")}${skipped > 0 ? `\n\nSkipped ${skipped} already-cataloged images` : ""}`
         }],
         details: { 
           catalogPath,
           classified,
           skipped,
           results,
-          model: visionModel.id,
-          provider: visionModel.provider,
+          model: visionResult.model.id,
+          provider: visionResult.model.provider,
           totalEntries: entries.length,
         },
       };
