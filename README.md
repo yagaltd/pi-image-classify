@@ -78,8 +78,7 @@ Use suggest_images with context="blog post about hiking"
 
 | Command | What it does |
 |---------|--------------|
-| `/classify` | Classify images in ./assets/images/ |
-| `/images` | Image catalog commands info |
+| `/classify` | Classify all images in ./assets/images/ |
 
 ## Tools
 

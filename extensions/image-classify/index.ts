@@ -942,7 +942,7 @@ export default function (pi: ExtensionAPI) {
   // --------------------------------------------------------------------------
   
   pi.registerCommand("classify", {
-    description: "Classify images in ./assets/images/ and add to catalog",
+    description: "Classify all images in ./assets/images/ and add to catalog CSV",
     handler: async (args, ctx) => {
       const current = ctx.model;
       const supportsVision = current && current.input && current.input.includes("image");
@@ -951,28 +951,16 @@ export default function (pi: ExtensionAPI) {
         : "(no vision model selected)";
       
       ctx.ui.notify(`Classifying with ${modelInfo}...`, "info");
-    },
-  });
-
-  pi.registerCommand("images", {
-    description: "Image catalog commands: search, sync, stats",
-    handler: async (args, ctx) => {
-      const stats = ctx.ui.hasUI ? await ctx.ui.select("Select command:", [
-        "search - Search catalog",
-        "sync - Sync from nanobanana",
-        "stats - View statistics",
-        "models - List vision models",
-      ]) : null;
       
-      if (stats?.startsWith("search")) {
-        ctx.ui.notify("Use: search_images with query=...", "info");
-      } else if (stats?.startsWith("sync")) {
-        ctx.ui.notify("Use: sync_nanobanana tool", "info");
-      } else if (stats?.startsWith("stats")) {
-        ctx.ui.notify("Use: get_catalog_stats tool", "info");
-      } else if (stats?.startsWith("models")) {
-        ctx.ui.notify("Use: list_vision_models tool", "info");
-      }
+      // Inject a user message to trigger the classify_folder tool
+      ctx.sessionManager.appendMessage({
+        role: "user",
+        content: [{
+          type: "text",
+          text: `Use classify_folder with folder="./assets/images"`
+        }],
+        timestamp: Date.now(),
+      });
     },
   });
 }
