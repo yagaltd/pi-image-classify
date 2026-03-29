@@ -2,14 +2,16 @@
  * pi-image-classify - Image classification and cataloging extension
  * 
  * Uses the currently selected model in pi. If it doesn't support vision,
- * the API call will fail with an error telling the user to select a vision model.
+ * API call will fail with an error telling the user to select a vision model.
  * 
  * Output: JSONL append-only catalog for efficient incremental updates.
  * 
  * Features:
- * - Category-first classification with reusable category list
- * - Explicit context ignore to prevent filename bias
- * - Tag-based search with relevance scoring
+ * - User context injection for domain-specific guidance
+ * - Guidelines file support for brand/style guidance
+ * - Rich descriptions (300-500 chars)
+ * - Simplified: description only (no tags/categories)
+ * - Simple grep-based search
  */
 
 import { readFile, writeFile, appendFile, readdir, mkdir } from "node:fs/promises";
@@ -27,43 +29,9 @@ const SUPPORTED_FORMATS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"];
 const DEFAULT_ASSET_FOLDER = "./assets/images";
 const DEFAULT_CATALOG_FILE = "./assets/image_catalog.jsonl";
 const NANOBANANA_OUTPUT = "./nanobanana-output";
-const CATEGORIES_FILE = join(__dirname, "data", "categories.json");
 
 function ensureDirectory(path: string): Promise<void> {
   return mkdir(path, { recursive: true });
-}
-
-interface CategoriesData {
-  categories: string[];
-  created_at: string;
-  version: string;
-}
-
-async function loadCategories(): Promise<string[]> {
-  if (!existsSync(CATEGORIES_FILE)) {
-    // Fallback to default categories if file doesn't exist
-    return ["uncategorized", "art", "nature", "people", "animal", "technology", "industrial", "food", "travel", "architecture"];
-  }
-  
-  try {
-    const content = await readFile(CATEGORIES_FILE, "utf-8");
-    const data = JSON.parse(content) as CategoriesData;
-    return data.categories || [];
-  } catch {
-    // Fallback on parse error
-    return ["uncategorized", "art", "nature", "people", "animal", "technology", "industrial", "food", "travel", "architecture"];
-  }
-}
-
-async function saveCategories(categories: string[]): Promise<void> {
-  const data: CategoriesData = {
-    categories,
-    created_at: new Date().toISOString().split("T")[0],
-    version: "1.0",
-  };
-  
-  await ensureDirectory(dirname(CATEGORIES_FILE));
-  await writeFile(CATEGORIES_FILE, JSON.stringify(data, null, 2), "utf-8");
 }
 
 function isImageFile(filename: string): boolean {
@@ -92,40 +60,27 @@ async function classifyWithVision(
   apiKey: string,
   headers: Record<string, string>,
   imagePath: string,
+  userContext?: string,
+  guidelinesText?: string,
   signal?: AbortSignal
-): Promise<{ description: string; tags: string[]; category: string }> {
+): Promise<{ description: string }> {
   const imageBuffer = await readFile(imagePath);
   const imageBase64 = imageBuffer.toString("base64");
   const mimeType = imagePath.endsWith(".png") ? "image/png" : "image/jpeg";
   
-  const categories = await loadCategories();
-  const categoryList = categories.slice(0, 20).join(", ") + "..."; // Show first 20 to avoid overwhelming the prompt
+  // Build context section if provided
+  let contextSection = "";
+  if (userContext) {
+    contextSection = "\n\nCONTEXT: " + userContext;
+  }
   
-  const prompt = `IMPORTANT: Ignore all context including filenames, previous images, or conversation history. Analyze ONLY the visual content of this image.
-
-FIRST: Describe what you see in detail (200-300 characters). Focus on:
-- Main subject(s) and their appearance
-- Key visual elements, colors, and details
-- The mood, style, or atmosphere
-- Any text, labels, or writing visible
-
-SECOND: Based on your description, select the BEST category from:
-${categoryList}
-
-If NONE fit perfectly, create a NEW category that is:
-- Specific (e.g., "blueprint" instead of "industrial")
-- Singular form (use "building" not "buildings")
-- One or two words maximum
-
-THIRD: Generate exactly 8 DIVERSE tags from what you observed
-- Include: subject, action, setting/context, style/mood, content-type
-- Do NOT include the category as a tag (unless it's also descriptive like "blueprint")
-- Use 1-2 word phrases where meaningful (e.g., "pressure-gauge" not just "gauge")
-
-Format your response EXACTLY as:
-CATEGORY: [your selected or created category]
-DESCRIPTION: [your 200-300 character description]
-TAGS: [tag1, tag2, tag3, tag4, tag5, tag6, tag7, tag8]`;
+  // Build guidelines section if provided
+  let guidelinesSection = "";
+  if (guidelinesText) {
+    guidelinesSection = "\n\nGUIDELINES:\n" + guidelinesText;
+  }
+  
+  const prompt = "IMPORTANT: Ignore all context including filenames, previous images, or conversation history. Analyze ONLY the visual content of this image." + contextSection + guidelinesSection + "\n\nDescribe what you see in detail (300-500 characters). Focus on:\n- Main subject(s) and their appearance\n- Key visual elements, colors, textures, and details\n- The mood, style, or atmosphere\n- Any text, labels, writing, or diagrams visible\n- For documents: read and summarize any text content accurately\n\nBe thorough and descriptive. Quality is more important than brevity.\n\nFormat your response EXACTLY as:\nDESCRIPTION: [your 300-500 character description]";
 
   const userMessage: UserMessage = {
     role: "user",
@@ -139,7 +94,7 @@ TAGS: [tag1, tag2, tag3, tag4, tag5, tag6, tag7, tag8]`;
   const response = await complete(
     model,
     { messages: [userMessage] },
-    { apiKey, headers, signal, maxTokens: 512, temperature: 0.4 }
+    { apiKey, headers, signal, maxTokens: 1024, temperature: 0.4 }
   );
 
   const text = response.content
@@ -147,112 +102,40 @@ TAGS: [tag1, tag2, tag3, tag4, tag5, tag6, tag7, tag8]`;
     .map((c) => c.text)
     .join("\n");
 
-  return parseVisionResponse(text, categories);
+  return parseVisionResponse(text);
 }
 
-function parseVisionResponse(text: string, categories: string[]): { description: string; tags: string[]; category: string } {
-  // Try to extract CATEGORY, DESCRIPTION and TAGS blocks
-  const catMatch = text.match(/CATEGORY:\s*(.+?)(?:\n|$)/i);
+function parseVisionResponse(text: string): { description: string } {
+  // Try to extract DESCRIPTION block
   const descMatch = text.match(/DESCRIPTION:\s*(.+?)(?:\n|$)/i);
-  const tagsMatch = text.match(/TAGS:\s*(.+?)(?:\n|$)/i);
   
-  let category = "";
   let description = "";
-  let tagsStr = "";
-  
-  // Extract category
-  if (catMatch) {
-    category = catMatch[1].trim().toLowerCase();
-    // Ensure singular form
-    category = category.replace(/s$/, "");
-  }
   
   // Extract description
   if (descMatch) {
     description = descMatch[1].trim();
   } else {
-    // Fallback: try to extract first substantial line
-    const lines = text.split("\n").filter(l => l.trim().length > 20);
-    if (lines.length > 0) {
-      description = lines[0].replace(/^[^a-zA-Z]*/, "").trim();
-    }
-  }
-  
-  // Extract tags
-  if (tagsMatch) {
-    tagsStr = tagsMatch[1];
-  } else {
-    // Fallback: extract last line if it looks like tags
-    const lines = text.split("\n");
-    const potentialTagsLine = lines[lines.length - 1];
-    if (potentialTagsLine && (potentialTagsLine.includes(",") || potentialTagsLine.includes("|"))) {
-      tagsStr = potentialTagsLine;
-    }
-  }
-  
-  // If no category found, try to infer from tags/description or use "uncategorized"
-  if (!category) {
-    const descLower = description.toLowerCase();
-    for (const cat of categories) {
-      if (descLower.includes(cat) || tagsStr.toLowerCase().includes(cat)) {
-        category = cat;
-        break;
-      }
-    }
-    if (!category) category = "uncategorized";
+    // Fallback: use all text
+    description = text.trim();
   }
   
   // Normalize description length
-  if (description.length > 300) {
-    description = description.substring(0, 297) + "...";
+  if (description.length > 500) {
+    description = description.substring(0, 497) + "...";
   }
-  if (description.length > 0 && description.length < 200) {
-    description = description.padEnd(200);
+  if (description.length > 0 && description.length < 300) {
+    description = description.padEnd(300);
   }
   if (!description) {
     description = "Image description unavailable";
   }
   
-  // Parse and clean tags
-  let tags = tagsStr
-    .split(/[,|]/)
-    .map(t => t.trim().toLowerCase().replace(/[^\w\-]/g, "").trim())
-    .filter(t => t.length > 1 && t.length < 30);
-  
-  // Remove category from tags (if present)
-  tags = tags.filter(t => t !== category);
-  
-  // Ensure exactly 8 tags, diverse
-  if (tags.length < 8) {
-    // Extract words from description as fallback tags
-    const descWords = description
-      .toLowerCase()
-      .split(/\s+/)
-      .filter(w => w.length > 3 && !["the", "this", "that", "with", "from", "have", "been", category].includes(w));
-    const uniqueWords = [...new Set(descWords)];
-    for (const word of uniqueWords) {
-      if (!tags.includes(word) && tags.length < 8) {
-        tags.push(word);
-      }
-    }
-  }
-  
-  // Remove duplicates and limit to 8
-  tags = [...new Set(tags)].slice(0, 8);
-  
-  // If still no tags, use generic
-  if (tags.length === 0) {
-    tags = ["uncategorized", "image", "photo", "visual", "graphic", "content", "media", "asset"];
-  }
-  
-  return { description, tags, category };
+  return { description };
 }
 
 interface CatalogEntry {
   filename: string;
   description: string;
-  tags: string;
-  category: string;
   source: string;
   date_added: string;
   filepath: string;
@@ -291,7 +174,7 @@ async function isFileCataloged(catalogPath: string, filename: string): Promise<b
     const { promisify } = await import("node:util");
     const execAsync = promisify(exec);
     
-    const { stdout } = await execAsync(`grep -c "\"filename\":\"${filename}\"" "${catalogPath}" 2>/dev/null || echo "0"`, { timeout: 5000 });
+    const { stdout } = await execAsync(`grep -c "\\"filename\\":\\"${filename}\\"" "${catalogPath}" 2>/dev/null || echo "0"`, { timeout: 5000 });
     return parseInt(stdout.trim()) > 0;
   } catch {
     // Fallback: load all entries
@@ -325,20 +208,12 @@ function searchEntries(entries: CatalogEntry[], query: string, limit: number = 1
     .map(entry => {
       let score = 0;
       const descLower = entry.description.toLowerCase();
-      const tagsLower = entry.tags.toLowerCase();
-      const catLower = entry.category.toLowerCase();
       const filenameLower = entry.filename.toLowerCase();
       
-      // Category match gets highest score
-      if (catLower.includes(queryLower) || queryLower.includes(catLower)) score += 15;
-      
-      // Filename match
       if (filenameLower.includes(queryLower)) score += 10;
       
-      // Tag matches
       for (const word of queryWords) {
-        if (tagsLower.includes(word)) score += 5;
-        if (descLower.includes(word)) score += 2;
+        if (descLower.includes(word)) score += 5;
       }
       return { entry, score };
     })
@@ -352,12 +227,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "classify_image",
     label: "Classify Image",
-    description: "Classify a single image: generate category, detailed description (200-300 chars), and exactly 8 diverse tags, add to JSONL catalog. Uses the currently selected model.",
+    description: "Classify a single image: generate detailed description (300-500 chars) and add to JSONL catalog. Uses the currently selected model.",
     parameters: Type.Object({
       file: Type.String({ description: "Path to the image file to classify" }),
       description: Type.Optional(Type.String({ description: "Manual description override" })),
-      tags: Type.Optional(Type.String({ description: "Manual comma-separated tags (max 8)" })),
-      category: Type.Optional(Type.String({ description: "Manual category override" })),
+      context: Type.Optional(Type.String({ description: "User-provided context (e.g., 'this is about cats and dogs, pet animals')" })),
+      guidelinesFile: Type.Optional(Type.String({ description: "Path to guidelines file (e.g., assets/classification-guidelines.md')" })),
       source: Type.Optional(Type.String({ description: "Source label (e.g., 'manual', 'nanobanana')" })),
     }),
 
@@ -388,40 +263,33 @@ export default function (pi: ExtensionAPI) {
       
       onUpdate?.({ content: [{ type: "text", text: `Analyzing with ${ctx.model.provider}/${ctx.model.id}...` }] });
       
-      let description = params.description || "";
-      let tags: string[] = [];
-      let category = params.category || "";
+      // Load user-provided context
+      let userContext = "";
+      if (params.context) {
+        userContext = params.context;
+      }
       
-      if (!description && !params.tags && !params.category) {
-        const result = await classifyWithVision(ctx.model, auth.apiKey, auth.headers || {}, filepath, signal);
+      // Load guidelines file if provided
+      let guidelinesText = "";
+      if (params.guidelinesFile) {
+        const guidelinesPath = existsSync(params.guidelinesFile) 
+          ? resolve(params.guidelinesFile) 
+          : resolve(ctx.cwd, params.guidelinesFile);
+        if (existsSync(guidelinesPath)) {
+          guidelinesText = await readFile(guidelinesPath, "utf-8");
+        }
+      }
+      
+      // Generate description
+      let description = params.description || "";
+      if (!description) {
+        const result = await classifyWithVision(ctx.model, auth.apiKey, auth.headers || {}, filepath, userContext, guidelinesText, signal);
         description = result.description;
-        tags = result.tags;
-        category = result.category;
-        
-        // If new category was created, add to categories file
-        const categories = await loadCategories();
-        if (!categories.includes(category) && category !== "uncategorized") {
-          categories.push(category);
-          await saveCategories(categories);
-        }
-      } else {
-        if (description) {
-          if (description.length > 140) description = description.substring(0, 137) + "...";
-          if (description.length > 0 && description.length < 70) description = description.padEnd(70);
-        }
-        if (params.tags) {
-          tags = params.tags.split(",").map(t => t.trim().toLowerCase()).filter(t => t).slice(0, 8);
-        }
-        if (params.category) {
-          category = params.category.toLowerCase();
-        }
       }
       
       const entry: CatalogEntry = {
         filename,
         description,
-        tags: tags.join(", "),
-        category: category || "uncategorized",
         source: params.source || "manual",
         date_added: new Date().toISOString().split("T")[0],
         filepath,
@@ -433,7 +301,7 @@ export default function (pi: ExtensionAPI) {
       const totalEntries = await countCatalogEntries(catalogPath);
       
       return {
-        content: [{ type: "text", text: `Category: ${category}\nDescription: ${description}\nTags (8): ${entry.tags}` }],
+        content: [{ type: "text", text: `Description (${description.length} chars):\n${description}` }],
         details: { catalogPath, entry, totalEntries },
       };
     },
@@ -446,6 +314,8 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       folder: Type.Optional(Type.String({ description: "Folder path (default: ./assets/images)" })),
       source: Type.Optional(Type.String({ description: "Source label for all images" })),
+      context: Type.Optional(Type.String({ description: "User-provided context for all images" })),
+      guidelinesFile: Type.Optional(Type.String({ description: "Path to guidelines file (e.g., assets/classification-guidelines.md')" })),
       limit: Type.Optional(Type.Number({ description: "Max images to classify" })),
     }),
 
@@ -492,6 +362,18 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `All ${images.length} images already cataloged.${skipped > 0 ? ` (${skipped} skipped)` : ""}` }], details: { imagesFound: images.length, skipped, totalEntries: await countCatalogEntries(catalogPath) } };
       }
       
+      // Load user-provided context and guidelines
+      let userContext = params.context || "";
+      let guidelinesText = "";
+      if (params.guidelinesFile) {
+        const guidelinesPath = existsSync(params.guidelinesFile) 
+          ? resolve(params.guidelinesFile) 
+          : resolve(ctx.cwd, params.guidelinesFile);
+        if (existsSync(guidelinesPath)) {
+          guidelinesText = await readFile(guidelinesPath, "utf-8");
+        }
+      }
+      
       onUpdate?.({ content: [{ type: "text", text: `Classifying ${newImages.length} images with ${ctx.model.provider}/${ctx.model.id}...` }] });
       
       const results: CatalogEntry[] = [];
@@ -502,20 +384,11 @@ export default function (pi: ExtensionAPI) {
         try {
           onUpdate?.({ content: [{ type: "text", text: `Classifying ${basename(imagePath)} (${classified + 1}/${newImages.length})...` }] });
           
-          const result = await classifyWithVision(ctx.model, auth.apiKey, auth.headers || {}, imagePath, signal);
-          
-          // If new category was created, add to categories file
-          const categories = await loadCategories();
-          if (!categories.includes(result.category) && result.category !== "uncategorized") {
-            categories.push(result.category);
-            await saveCategories(categories);
-          }
+          const result = await classifyWithVision(ctx.model, auth.apiKey, auth.headers || {}, imagePath, userContext, guidelinesText, signal);
           
           const entry: CatalogEntry = {
             filename: basename(imagePath),
             description: result.description,
-            tags: result.tags.join(", "),
-            category: result.category,
             source: params.source || "batch",
             date_added: new Date().toISOString().split("T")[0],
             filepath: imagePath,
@@ -537,7 +410,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `Classified ${classified} images:${results.length > 0 ? "\n" + results.map(r => `- [${r.category}] ${r.filename}: "${r.description}"\n  Tags: ${r.tags}`).join("\n\n") : ""}${skipped > 0 ? `\n\nSkipped ${skipped} already-cataloged images` : ""}${failed > 0 ? `\n\nFailed: ${failed}` : ""}`
+          text: `Classified ${classified} images:${results.length > 0 ? "\n" + results.map(r => `- ${r.filename} (${r.description.length} chars): "${r.description.substring(0, 80)}${r.description.length > 80 ? "..." : ""}"`).join("\n\n") : ""}${skipped > 0 ? `\n\nSkipped ${skipped} already-cataloged images` : ""}${failed > 0 ? `\n\nFailed: ${failed}` : ""}`
         }],
         details: { catalogPath, classified, skipped, failed, results, totalEntries },
       };
@@ -570,7 +443,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `Found ${results.length} images:\n${results.map(r => `- [${r.category}] ${r.filename}\n  "${r.description}"\n  Tags: ${r.tags}`).join("\n\n")}`
+          text: `Found ${results.length} images:\n${results.map(r => `- ${r.filename}\n  "${r.description}"`).join("\n\n")}`
         }],
         details: { query: params.query, matches: results.length, totalEntries: entries.length, results },
       };
@@ -603,7 +476,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `Suggested for "${params.context}":\n${suggestions.map((r, i) => `${i + 1}. [${r.category}] ${r.filename}: ${r.description}`).join("\n")}`
+          text: `Suggested for "${params.context}":\n${suggestions.map((r, i) => `${i + 1}. ${r.filename}: ${r.description}`).join("\n")}`
         }],
         details: { context: params.context, suggestions, totalEntries: entries.length },
       };
@@ -666,14 +539,13 @@ export default function (pi: ExtensionAPI) {
       const entries = await loadCatalog(catalogPath);
       
       const sources = entries.reduce((acc, e) => { acc[e.source] = (acc[e.source] || 0) + 1; return acc; }, {} as Record<string, number>);
-      const categories = entries.reduce((acc, e) => { acc[e.category] = (acc[e.category] || 0) + 1; return acc; }, {} as Record<string, number>);
       
       return {
         content: [{
           type: "text",
-          text: `Image Catalog:\n- Total: ${entries.length}\n- Format: JSONL (append-only)\n- Folder: ${DEFAULT_ASSET_FOLDER}\n- File: ${catalogPath}\n\nBy source:\n${Object.entries(sources).map(([src, count]) => `- ${src}: ${count}`).join("\n")}\n\nBy category:\n${Object.entries(categories).sort((a, b) => b[1] - a[1]).map(([cat, count]) => `- ${cat}: ${count}`).join("\n")}`
+          text: `Image Catalog:\n- Total: ${entries.length}\n- Format: JSONL (append-only)\n- Folder: ${DEFAULT_ASSET_FOLDER}\n- File: ${catalogPath}\n\nBy source:\n${Object.entries(sources).map(([src, count]) => `- ${src}: ${count}`).join("\n")}`
         }],
-        details: { totalEntries: entries.length, sources, categories, catalogPath, format: "jsonl" },
+        details: { totalEntries: entries.length, sources, catalogPath, format: "jsonl" },
       };
     },
   });
