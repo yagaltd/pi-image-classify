@@ -627,23 +627,4 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
-
-  
-  
-  
-  pi.registerCommand("classify", {
-    description: "Classify images in ./assets/images/ and add to catalog",
-    handler: async (args, ctx) => {
-      if (!ctx.model) {
-        ctx.ui.notify("No model selected. Use /model first.", "warning");
-        return;
-      }
-      ctx.ui.notify(`Classifying with ${ctx.model.provider}/${ctx.model.id}...`, "info");
-      ctx.sessionManager.appendMessage({
-        role: "user",
-        content: [{ type: "text", text: `Use classify_folder with folder="./assets/images"` }],
-        timestamp: Date.now(),
-      });
-    },
-  });
 }
