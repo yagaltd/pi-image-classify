@@ -5,6 +5,9 @@ node_modules/
 assets/
 nanobanana-output/
 
+# Category data (user-managed, but include initial version)
+# extensions/image-classify/data/categories.json
+
 # OS
 .DS_Store
 Thumbs.db
