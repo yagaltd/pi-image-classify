@@ -48,7 +48,7 @@ Use classify_folder with folder="assets/images"
 ## Output
 
 - Images: `./assets/images/`
-- Catalog: `./assets/image_catalog.csv`
+- Catalog: `./assets/image_catalog.jsonl` (JSONL append-only for efficient incremental updates)
 
 ## Model
 

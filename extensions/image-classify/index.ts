@@ -3,9 +3,11 @@
  * 
  * Uses the currently selected model in pi. If it doesn't support vision,
  * the API call will fail with an error telling the user to select a vision model.
+ * 
+ * Output: JSONL append-only catalog for efficient incremental updates.
  */
 
-import { readFile, writeFile, readdir, mkdir } from "node:fs/promises";
+import { readFile, writeFile, appendFile, readdir, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve, basename, extname } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -13,12 +15,8 @@ import { Type } from "@sinclair/typebox";
 
 const SUPPORTED_FORMATS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"];
 const DEFAULT_ASSET_FOLDER = "./assets/images";
-const DEFAULT_CATALOG_FILE = "./assets/image_catalog.csv";
+const DEFAULT_CATALOG_FILE = "./assets/image_catalog.jsonl";
 const NANOBANANA_OUTPUT = "./nanobanana-output";
-
-// ============================================================================
-// Helpers
-// ============================================================================
 
 function ensureDirectory(path: string): Promise<void> {
   return mkdir(path, { recursive: true });
@@ -42,37 +40,6 @@ async function listImages(dirPath: string): Promise<string[]> {
   return images;
 }
 
-function escapeCSV(value: string): string {
-  if (value.includes(",") || value.includes('"') || value.includes("\n")) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
-}
-
-function parseCSVLine(line: string): string[] {
-  const result: string[] = [];
-  let current = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    if (char === '"') {
-      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
-      else { inQuotes = !inQuotes; }
-    } else if (char === "," && !inQuotes) {
-      result.push(current.trim());
-      current = "";
-    } else {
-      current += char;
-    }
-  }
-  result.push(current.trim());
-  return result;
-}
-
-// ============================================================================
-// Classification
-// ============================================================================
-
 async function classifyWithVision(
   model: any,
   apiKey: string,
@@ -84,10 +51,18 @@ async function classifyWithVision(
   const mimeType = imagePath.endsWith(".png") ? "image/png" : "image/jpeg";
   
   const prompt = `Analyze this image and provide:
-1. A SHORT description (70-140 characters) - capture the essence
-2. Tags (comma-separated, max 10, single words)
+1. A SHORT description (70-140 characters) - capture the ESSENCE and UNIQUENESS of what's shown
+2. Tags (comma-separated, EXACTLY 8, DIVERSE single words)
 
-Format: DESCRIPTION: [desc] TAGS: [tag1, tag2, ...]`;
+IMPORTANT for tags:
+- Include: subject, action, setting/context, style/mood, content-type
+- AVOID generic categories like "industrial", "iot", "business" unless truly specific
+- Focus on SPECIFIC content visible in the image
+- Use 1-2 word phrases where meaningful (e.g., "pressure-gauge" not just "gauge")
+
+Format your response EXACTLY as:
+DESCRIPTION: [your 70-140 character description here]
+TAGS: [tag1, tag2, tag3, tag4, tag5, tag6, tag7, tag8]`;
 
   const text = await callVisionAPI(model, apiKey, imageBase64, mimeType, prompt, signal);
   return parseVisionResponse(text);
@@ -97,7 +72,7 @@ async function callVisionAPI(model: any, apiKey: string, imageBase64: string, mi
   const provider = model.provider;
   
   if (provider === "google" || provider === "google-gemini-cli" || provider === "google-vertex" || provider === "google-antigravity") {
-    const baseUrl = model.baseUrl || "https://generativelanguage.googleapis.com/v1beta";
+    const baseUrl = model.baseUrl || "https://generativelanguage.googleapis.com";
     const modelId = model.id.includes("gemini-2") ? model.id : "gemini-2.0-flash";
     const url = `${baseUrl}/models/${modelId}:generateContent?key=${apiKey}`;
     
@@ -107,7 +82,7 @@ async function callVisionAPI(model: any, apiKey: string, imageBase64: string, mi
       signal,
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType, data: imageBase64 } }] }],
-        generationConfig: { maxOutputTokens: 256, temperature: 0.3 }
+        generationConfig: { maxOutputTokens: 512, temperature: 0.4 }
       }),
     });
     
@@ -124,7 +99,7 @@ async function callVisionAPI(model: any, apiKey: string, imageBase64: string, mi
       signal,
       body: JSON.stringify({
         model: model.id,
-        max_tokens: 256,
+        max_tokens: 512,
         messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: mimeType, data: imageBase64 } }, { type: "text", text: prompt }] }]
       }),
     });
@@ -143,7 +118,7 @@ async function callVisionAPI(model: any, apiKey: string, imageBase64: string, mi
       body: JSON.stringify({
         model: model.id,
         messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } }, { type: "text", text: prompt }] }],
-        max_tokens: 256,
+        max_tokens: 512,
       }),
     });
     
@@ -152,15 +127,15 @@ async function callVisionAPI(model: any, apiKey: string, imageBase64: string, mi
     return data.choices?.[0]?.message?.content || "";
   }
   
-  // Fallback to Google Gemini format
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  // Default: Gemini-compatible API
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model.id}:generateContent?key=${apiKey}`;
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     signal,
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType, data: imageBase64 } }] }],
-      generationConfig: { maxOutputTokens: 256, temperature: 0.3 }
+      generationConfig: { maxOutputTokens: 512, temperature: 0.4 }
     }),
   });
   
@@ -170,34 +145,91 @@ async function callVisionAPI(model: any, apiKey: string, imageBase64: string, mi
 }
 
 function parseVisionResponse(text: string): { description: string; tags: string[] } {
+  // Try to extract DESCRIPTION and TAGS blocks
   const descMatch = text.match(/DESCRIPTION:\s*(.+?)(?:\n|$)/i);
   const tagsMatch = text.match(/TAGS:\s*(.+?)(?:\n|$)/i);
   
-  let description = descMatch?.[1]?.trim() || "Image description unavailable";
-  let tagsStr = tagsMatch?.[1]?.trim() || "";
+  let description = "";
+  let tagsStr = "";
   
-  if (description.length > 140) description = description.substring(0, 137) + "...";
-  if (description.length < 70) description = description.padEnd(70);
-  
-  let tags = tagsStr.split(",").map(t => t.trim().toLowerCase()).filter(t => t);
-  if (tags.length === 0) {
-    tags = description.toLowerCase().split(/\s+/).filter(w => w.length > 3).slice(0, 10);
+  if (descMatch) {
+    description = descMatch[1].trim();
+  } else {
+    // Fallback: try to extract first substantial line
+    const lines = text.split("\n").filter(l => l.trim().length > 20);
+    if (lines.length > 0) {
+      description = lines[0].replace(/^[^a-zA-Z]*/, "").trim();
+    }
   }
   
-  return { description, tags: [...new Set(tags)].slice(0, 10) };
+  if (tagsMatch) {
+    tagsStr = tagsMatch[1];
+  } else {
+    // Fallback: extract last line if it looks like tags
+    const lines = text.split("\n");
+    const potentialTagsLine = lines[lines.length - 1];
+    if (potentialTagsLine && (potentialTagsLine.includes(",") || potentialTagsLine.includes("|"))) {
+      tagsStr = potentialTagsLine;
+    }
+  }
+  
+  // Normalize description length
+  if (description.length > 140) {
+    description = description.substring(0, 137) + "...";
+  }
+  if (description.length > 0 && description.length < 70) {
+    description = description.padEnd(70);
+  }
+  if (!description) {
+    description = "Image description unavailable";
+  }
+  
+  // Parse and clean tags
+  let tags = tagsStr
+    .split(/[,|]/)
+    .map(t => t.trim().toLowerCase().replace(/[^\w\-]/g, "").trim())
+    .filter(t => t.length > 1 && t.length < 30);
+  
+  // Ensure exactly 8 tags, diverse
+  if (tags.length < 8) {
+    // Extract words from description as fallback tags
+    const descWords = description
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(w => w.length > 3 && !["the", "this", "that", "with", "from", "have", "been"].includes(w));
+    const uniqueWords = [...new Set(descWords)];
+    for (const word of uniqueWords) {
+      if (!tags.includes(word) && tags.length < 8) {
+        tags.push(word);
+      }
+    }
+  }
+  
+  // Remove duplicates and limit to 8
+  tags = [...new Set(tags)].slice(0, 8);
+  
+  // If still no tags, use generic
+  if (tags.length === 0) {
+    tags = ["uncategorized", "image", "photo", "visual", "graphic", "content", "media", "asset"];
+  }
+  
+  return { description, tags };
 }
-
-// ============================================================================
-// Catalog Management
-// ============================================================================
 
 interface CatalogEntry {
   filename: string;
   description: string;
   tags: string;
   source: string;
-  dateAdded: string;
+  date_added: string;
   filepath: string;
+  classified_at: string;
+}
+
+// JSONL functions - append-only for efficiency
+async function appendCatalogEntry(catalogPath: string, entry: CatalogEntry): Promise<void> {
+  const jsonLine = JSON.stringify(entry) + "\n";
+  await appendFile(catalogPath, jsonLine, "utf-8");
 }
 
 async function loadCatalog(catalogPath: string): Promise<CatalogEntry[]> {
@@ -205,25 +237,51 @@ async function loadCatalog(catalogPath: string): Promise<CatalogEntry[]> {
   if (!existsSync(catalogPath)) return entries;
   
   const content = await readFile(catalogPath, "utf-8");
-  const lines = content.split("\n").filter(l => l.trim() && !l.startsWith("#") && !l.startsWith("filename"));
+  const lines = content.split("\n").filter(l => l.trim());
   
   for (const line of lines) {
-    const parts = parseCSVLine(line);
-    if (parts.length >= 5) {
-      entries.push({ filename: parts[0], description: parts[1], tags: parts[2], source: parts[3], dateAdded: parts[4], filepath: parts[5] || parts[0] });
-    }
+    try {
+      const entry = JSON.parse(line);
+      entries.push(entry);
+    } catch { /* skip malformed lines */ }
   }
   return entries;
 }
 
-async function saveCatalog(catalogPath: string, entries: CatalogEntry[]): Promise<void> {
-  const header = "filename,description,tags,source,date_added,filepath";
-  const lines = entries.map(e => [escapeCSV(e.filename), escapeCSV(e.description), escapeCSV(e.tags), escapeCSV(e.source), e.dateAdded, escapeCSV(e.filepath)].join(","));
-  await writeFile(catalogPath, [header, ...lines].join("\n") + "\n", "utf-8");
+// O(1) check if file is already cataloged (using grep)
+async function isFileCataloged(catalogPath: string, filename: string): Promise<boolean> {
+  if (!existsSync(catalogPath)) return false;
+  
+  // Quick grep check for filename in JSONL
+  try {
+    const { exec } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execAsync = promisify(exec);
+    
+    const { stdout } = await execAsync(`grep -c "\"filename\":\"${filename}\"" "${catalogPath}" 2>/dev/null || echo "0"`, { timeout: 5000 });
+    return parseInt(stdout.trim()) > 0;
+  } catch {
+    // Fallback: load all entries
+    const entries = await loadCatalog(catalogPath);
+    return entries.some(e => e.filename === filename);
+  }
 }
 
-function entryExists(entries: CatalogEntry[], filepath: string): boolean {
-  return entries.some(e => e.filepath === filepath || e.filename === basename(filepath));
+// Count catalog entries efficiently
+async function countCatalogEntries(catalogPath: string): Promise<number> {
+  if (!existsSync(catalogPath)) return 0;
+  
+  try {
+    const { exec } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execAsync = promisify(exec);
+    
+    const { stdout } = await execAsync(`wc -l < "${catalogPath}"`, { timeout: 5000 });
+    return parseInt(stdout.trim()) || 0;
+  } catch {
+    const entries = await loadCatalog(catalogPath);
+    return entries.length;
+  }
 }
 
 function searchEntries(entries: CatalogEntry[], query: string, limit: number = 10): CatalogEntry[] {
@@ -250,23 +308,19 @@ function searchEntries(entries: CatalogEntry[], query: string, limit: number = 1
     .map(s => s.entry);
 }
 
-// ============================================================================
-// Extension
-// ============================================================================
-
 export default function (pi: ExtensionAPI) {
   
-  // --------------------------------------------------------------------------
-  // Tool: classify_image
-  // --------------------------------------------------------------------------
+  
+  
+  
   pi.registerTool({
     name: "classify_image",
     label: "Classify Image",
-    description: "Classify a single image: generate description (70-140 chars) and tags, add to catalog CSV. Uses the currently selected model.",
+    description: "Classify a single image: generate description (70-140 chars) and exactly 8 diverse tags, add to JSONL catalog. Uses the currently selected model.",
     parameters: Type.Object({
       file: Type.String({ description: "Path to the image file to classify" }),
       description: Type.Optional(Type.String({ description: "Manual description override" })),
-      tags: Type.Optional(Type.String({ description: "Manual comma-separated tags" })),
+      tags: Type.Optional(Type.String({ description: "Manual comma-separated tags (max 8)" })),
       source: Type.Optional(Type.String({ description: "Source label (e.g., 'manual', 'nanobanana')" })),
     }),
 
@@ -281,9 +335,11 @@ export default function (pi: ExtensionAPI) {
       if (!existsSync(filepath)) throw new Error(`Image not found: ${filepath}`);
       if (!isImageFile(filepath)) throw new Error(`Not an image file: ${filepath}`);
       
-      const entries = await loadCatalog(catalogPath);
-      if (entryExists(entries, filepath)) {
-        return { content: [{ type: "text", text: `Already cataloged: ${basename(filepath)}` }], details: { alreadyExists: true } };
+      const filename = basename(filepath);
+      
+      // Quick O(1) check if already cataloged
+      if (await isFileCataloged(catalogPath, filename)) {
+        return { content: [{ type: "text", text: `Already cataloged: ${filename}` }], details: { alreadyExists: true } };
       }
       
       if (!ctx.model) throw new Error("No model selected. Use /model to select a vision-capable model.");
@@ -302,37 +358,41 @@ export default function (pi: ExtensionAPI) {
       } else {
         if (description) {
           if (description.length > 140) description = description.substring(0, 137) + "...";
-          if (description.length < 70) description = description.padEnd(70);
+          if (description.length > 0 && description.length < 70) description = description.padEnd(70);
         }
-        if (params.tags) tags = params.tags.split(",").map(t => t.trim()).filter(t => t);
+        if (params.tags) {
+          tags = params.tags.split(",").map(t => t.trim().toLowerCase()).filter(t => t).slice(0, 8);
+        }
       }
       
       const entry: CatalogEntry = {
-        filename: basename(filepath),
+        filename,
         description,
         tags: tags.join(", "),
         source: params.source || "manual",
-        dateAdded: new Date().toISOString().split("T")[0],
+        date_added: new Date().toISOString().split("T")[0],
         filepath,
+        classified_at: new Date().toISOString(),
       };
       
-      entries.push(entry);
-      await saveCatalog(catalogPath, entries);
+      // Append-only write to JSONL
+      await appendCatalogEntry(catalogPath, entry);
+      const totalEntries = await countCatalogEntries(catalogPath);
       
       return {
-        content: [{ type: "text", text: `Classified: ${description}\nTags: ${entry.tags}` }],
-        details: { catalogPath, entry, totalEntries: entries.length },
+        content: [{ type: "text", text: `Classified: ${description}\nTags (8): ${entry.tags}` }],
+        details: { catalogPath, entry, totalEntries },
       };
     },
   });
 
-  // --------------------------------------------------------------------------
-  // Tool: classify_folder
-  // --------------------------------------------------------------------------
+  
+  
+  
   pi.registerTool({
     name: "classify_folder",
     label: "Classify Folder",
-    description: "Batch classify all images in a folder. Uses the currently selected model.",
+    description: "Batch classify all images in a folder. Uses the currently selected model. Skips already-cataloged images (incremental).",
     parameters: Type.Object({
       folder: Type.Optional(Type.String({ description: "Folder path (default: ./assets/images)" })),
       source: Type.Optional(Type.String({ description: "Source label for all images" })),
@@ -359,18 +419,31 @@ export default function (pi: ExtensionAPI) {
       const apiKey = await ctx.modelRegistry.getApiKeyForProvider(ctx.model.provider);
       if (!apiKey) throw new Error(`No API key for ${ctx.model.provider}. Configure it in settings.`);
       
-      const entries = await loadCatalog(catalogPath);
-      const newImages = images.filter(img => !entryExists(entries, img)).slice(0, params.limit || undefined);
-      const skipped = images.length - newImages.length;
+      // Filter out already-cataloged images (O(1) per file via grep)
+      const imagesToProcess: string[] = [];
+      let skipped = 0;
+      
+      for (const img of images) {
+        const filename = basename(img);
+        if (await isFileCataloged(catalogPath, filename)) {
+          skipped++;
+        } else {
+          imagesToProcess.push(img);
+        }
+      }
+      
+      // Apply limit
+      const newImages = imagesToProcess.slice(0, params.limit || undefined);
       
       if (newImages.length === 0) {
-        return { content: [{ type: "text", text: `All ${images.length} images already cataloged.` }], details: { imagesFound: images.length, skipped, totalEntries: entries.length } };
+        return { content: [{ type: "text", text: `All ${images.length} images already cataloged.${skipped > 0 ? ` (${skipped} skipped)` : ""}` }], details: { imagesFound: images.length, skipped, totalEntries: await countCatalogEntries(catalogPath) } };
       }
       
       onUpdate?.({ content: [{ type: "text", text: `Classifying ${newImages.length} images with ${ctx.model.provider}/${ctx.model.id}...` }] });
       
       const results: CatalogEntry[] = [];
       let classified = 0;
+      let failed = 0;
       
       for (const imagePath of newImages) {
         try {
@@ -383,33 +456,36 @@ export default function (pi: ExtensionAPI) {
             description: result.description,
             tags: result.tags.join(", "),
             source: params.source || "batch",
-            dateAdded: new Date().toISOString().split("T")[0],
+            date_added: new Date().toISOString().split("T")[0],
             filepath: imagePath,
+            classified_at: new Date().toISOString(),
           };
           
-          entries.push(entry);
+          // Append-only to JSONL
+          await appendCatalogEntry(catalogPath, entry);
           results.push(entry);
           classified++;
         } catch (error) {
           console.error(`Failed to classify ${imagePath}:`, error);
+          failed++;
         }
       }
       
-      await saveCatalog(catalogPath, entries);
+      const totalEntries = await countCatalogEntries(catalogPath);
       
       return {
         content: [{
           type: "text",
-          text: `Classified ${classified} images:\n${results.map(r => `- ${r.filename}: ${r.description}`).join("\n")}${skipped > 0 ? `\n\nSkipped ${skipped} already-cataloged images` : ""}`
+          text: `Classified ${classified} images:${results.length > 0 ? "\n" + results.map(r => `- ${r.filename}: "${r.description}"\n  Tags: ${r.tags}`).join("\n\n") : ""}${skipped > 0 ? `\n\nSkipped ${skipped} already-cataloged images` : ""}${failed > 0 ? `\n\nFailed: ${failed}` : ""}`
         }],
-        details: { catalogPath, classified, skipped, results, totalEntries: entries.length },
+        details: { catalogPath, classified, skipped, failed, results, totalEntries },
       };
     },
   });
 
-  // --------------------------------------------------------------------------
-  // Tool: search_images
-  // --------------------------------------------------------------------------
+  
+  
+  
   pi.registerTool({
     name: "search_images",
     label: "Search Images",
@@ -443,9 +519,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // --------------------------------------------------------------------------
-  // Tool: suggest_images
-  // --------------------------------------------------------------------------
+  
+  
+  
   pi.registerTool({
     name: "suggest_images",
     label: "Suggest Images",
@@ -479,9 +555,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // --------------------------------------------------------------------------
-  // Tool: sync_nanobanana
-  // --------------------------------------------------------------------------
+  
+  
+  
   pi.registerTool({
     name: "sync_nanobanana",
     label: "Sync Nanobanana",
@@ -527,9 +603,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // --------------------------------------------------------------------------
-  // Tool: get_catalog_stats
-  // --------------------------------------------------------------------------
+  
+  
+  
   pi.registerTool({
     name: "get_catalog_stats",
     label: "Catalog Stats",
@@ -545,16 +621,16 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `Image Catalog:\n- Total: ${entries.length}\n- Folder: ${DEFAULT_ASSET_FOLDER}\n- File: ${catalogPath}\n\nBy source:\n${Object.entries(sources).map(([src, count]) => `- ${src}: ${count}`).join("\n")}`
+          text: `Image Catalog:\n- Total: ${entries.length}\n- Format: JSONL (append-only)\n- Folder: ${DEFAULT_ASSET_FOLDER}\n- File: ${catalogPath}\n\nBy source:\n${Object.entries(sources).map(([src, count]) => `- ${src}: ${count}`).join("\n")}`
         }],
-        details: { totalEntries: entries.length, sources, catalogPath },
+        details: { totalEntries: entries.length, sources, catalogPath, format: "jsonl" },
       };
     },
   });
 
-  // --------------------------------------------------------------------------
-  // Command: /classify
-  // --------------------------------------------------------------------------
+  
+  
+  
   pi.registerCommand("classify", {
     description: "Classify images in ./assets/images/ and add to catalog",
     handler: async (args, ctx) => {

@@ -5,7 +5,7 @@ description: Image classification and cataloging for pi. Understand, tag, and se
 
 # Image Classify
 
-Classify images with AI and store in a searchable CSV catalog.
+Classify images with AI and store in a searchable JSONL catalog.
 
 ## Setup
 
@@ -20,7 +20,7 @@ mkdir -p assets/images
 Use classify_image with file="assets/images/myphoto.jpg"
 ```
 
-**Entire folder:**
+**Entire folder (incremental - skips already cataloged):**
 ```
 Use classify_folder with folder="assets/images"
 ```
@@ -49,18 +49,35 @@ Uses the currently selected model in pi. Make sure it's a vision-capable model:
 
 If the model doesn't support vision, you'll get an error. Select a different model and try again.
 
+## Output
+
+- Images: `./assets/images/`
+- Catalog: `./assets/image_catalog.jsonl` (JSONL append-only format)
+
+## Incremental Processing
+
+- Adding new images automatically skips already-cataloged files
+- Uses O(1) grep lookup for fast duplicate detection
+- No full catalog reload needed
+
+## Tag Guidelines
+
+Each image gets exactly 8 diverse tags covering:
+- Subject (what's in the image)
+- Action/function (what's happening)
+- Setting/context
+- Style/mood
+- Content type
+
+Tags are specific to the image content, not generic categories.
+
 ## Tools
 
 | Tool | Use |
 |------|-----|
 | `classify_image` | Classify single image |
-| `classify_folder` | Batch classify folder |
+| `classify_folder` | Batch classify folder (incremental) |
 | `search_images` | Search by text |
 | `suggest_images` | Get suggestions |
 | `sync_nanobanana` | Copy from nanobanana-output |
 | `get_catalog_stats` | View stats |
-
-## Output
-
-- Images: `./assets/images/`
-- Catalog: `./assets/image_catalog.csv`
